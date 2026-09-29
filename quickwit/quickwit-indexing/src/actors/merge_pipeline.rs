@@ -39,7 +39,8 @@ use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, instrument};
 
-use super::merge_planner::RunFinalizeMergePolicyAndQuit;
+use super::merge_drainer::{DrainProgress, MergeDrainer};
+use super::merge_planner::{QuitMergePlanner, RunFinalizeMergePolicyAndQuit};
 use super::{MergeExecutor, MergePlanner, MergeSplitDownloader, Packager};
 use crate::actors::indexing_pipeline::wait_duration_before_retry;
 use crate::actors::publisher::DisconnectMergePlanner;
@@ -69,6 +70,19 @@ static SPAWN_PIPELINE_SEMAPHORE: Semaphore = Semaphore::const_new(10);
 /// instance, if one of the actor is stuck).
 #[derive(Debug, Clone, Copy)]
 pub struct FinishPendingMergesAndShutdownPipeline;
+
+/// Instructs the merge pipeline to run merges until the merge policy proposes no more merge, then
+/// to shut down. The finalize merge policy is not run.
+///
+/// Unlike [`FinishPendingMergesAndShutdownPipeline`], the merge planner stays connected to the
+/// merge publisher, so merged splits can be merged again. This is used by
+/// `quickwit tool local-ingest` once all the indexing pipelines have completed: no new split is
+/// published by the indexing pipelines after this message is sent.
+///
+/// The actors of the pipeline are not respawned after this message is received. If one of them
+/// fails, the merge pipeline exits with a failure.
+#[derive(Debug, Clone, Copy)]
+pub struct DrainMergesAndShutdownPipeline;
 
 pub const SUPERVISE_LOOP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -114,6 +128,8 @@ pub struct MergePipeline {
     initial_immature_splits_opt: Option<Vec<SplitMetadata>>,
     // After it is set to true, we don't respawn pipeline actors if they fail.
     shutdown_initiated: bool,
+    /// Set while merges are drained, see [`DrainMergesAndShutdownPipeline`].
+    merge_drainer_opt: Option<MergeDrainer>,
 }
 
 #[async_trait]
@@ -160,6 +176,7 @@ impl MergePipeline {
             merge_planner_mailbox,
             initial_immature_splits_opt,
             shutdown_initiated: false,
+            merge_drainer_opt: None,
         }
     }
 
@@ -417,12 +434,42 @@ impl MergePipeline {
             Health::Healthy => {}
             Health::FailureOrUnhealthy => {
                 self.terminate().await;
+                if self.shutdown_initiated {
+                    // The pipeline is not respawned after shutdown was initiated. Exiting avoids
+                    // leaving an empty supervisor running forever.
+                    return Err(ActorExitStatus::from(anyhow::anyhow!(
+                        "merge pipeline failed during shutdown"
+                    )));
+                }
                 ctx.schedule_self_msg(*quickwit_actors::HEARTBEAT, Spawn { retry_count: 0 });
             }
             Health::Success => {
                 info!(index_uid=%self.params.pipeline_id.index_uid, "merge pipeline success, shutting down");
                 return Err(ActorExitStatus::Success);
             }
+        }
+        Ok(())
+    }
+
+    async fn drive_merge_drain(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
+        let Some(merge_drainer) = self.merge_drainer_opt.as_mut() else {
+            return Ok(());
+        };
+        if self.handles_opt.is_none() {
+            return Err(ActorExitStatus::from(anyhow::anyhow!(
+                "merge pipeline actors are not running while draining merges"
+            )));
+        }
+        let drain_progress = merge_drainer.drive(&self.merge_planner_mailbox)?;
+
+        if drain_progress == DrainProgress::FixpointReached {
+            self.merge_drainer_opt = None;
+            // The planner exits and releases its mailbox of the split downloader, and the other
+            // actors of the pipeline exit in cascade. The health check then observes the success
+            // of all the actors.
+            let _ = ctx
+                .send_message(&self.merge_planner_mailbox, QuitMergePlanner)
+                .await;
         }
         Ok(())
     }
@@ -471,6 +518,7 @@ impl Handler<SuperviseLoop> for MergePipeline {
     ) -> Result<(), ActorExitStatus> {
         self.perform_observe().await;
         self.perform_health_check(ctx).await?;
+        self.drive_merge_drain(ctx).await?;
         ctx.schedule_self_msg(SUPERVISE_LOOP_INTERVAL, supervise_loop_token);
         Ok(())
     }
@@ -511,6 +559,25 @@ impl Handler<FinishPendingMergesAndShutdownPipeline> for MergePipeline {
             // we won't respawn the pipeline in the future, so there is nothing
             // to do here.
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<DrainMergesAndShutdownPipeline> for MergePipeline {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: DrainMergesAndShutdownPipeline,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        if self.shutdown_initiated {
+            return Ok(());
+        }
+        info!(index_uid=%self.params.pipeline_id.index_uid, "draining merges before shutdown");
+        self.shutdown_initiated = true;
+        self.merge_drainer_opt = Some(MergeDrainer::new());
         Ok(())
     }
 }

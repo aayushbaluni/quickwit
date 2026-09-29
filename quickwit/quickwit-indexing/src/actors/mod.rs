@@ -18,6 +18,7 @@ mod index_serializer;
 mod indexer;
 mod indexing_pipeline;
 mod indexing_service;
+mod merge_drainer;
 mod merge_executor;
 pub(crate) mod merge_pipeline;
 mod merge_planner;
@@ -37,7 +38,8 @@ pub use indexing_pipeline::{IndexingPipeline, IndexingPipelineParams};
 pub use indexing_service::{INDEXING_DIR_NAME, IndexingService, IndexingServiceCounters};
 pub use merge_executor::{MergeExecutor, combine_partition_ids, merge_split_attrs};
 pub use merge_pipeline::{
-    FinishPendingMergesAndShutdownPipeline, MergePipeline, MergePipelineParams,
+    DrainMergesAndShutdownPipeline, FinishPendingMergesAndShutdownPipeline, MergePipeline,
+    MergePipelineParams,
 };
 pub(crate) use merge_planner::MergePlanner;
 #[cfg(test)]

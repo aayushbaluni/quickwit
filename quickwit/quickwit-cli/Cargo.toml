@@ -38,6 +38,7 @@ openssl-probe = { workspace = true, optional = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+sysinfo = { workspace = true, optional = true, features = ["system"] }
 tabled = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -77,6 +78,7 @@ reqwest = { workspace = true }
 quickwit-actors = { workspace = true, features = ["testsuite"] }
 quickwit-common = { workspace = true, features = ["testsuite"] }
 quickwit-config = { workspace = true, features = ["testsuite"] }
+quickwit-indexing = { workspace = true, features = ["testsuite"] }
 quickwit-metastore = { workspace = true, features = ["testsuite"] }
 quickwit-proto = { workspace = true, features = ["testsuite"] }
 quickwit-storage = { workspace = true, features = ["testsuite"] }
@@ -93,6 +95,8 @@ jemalloc-profiled = [
 ci-test = []
 pprof = ["quickwit-serve/pprof"]
 openssl-support = ["openssl-probe"]
+# Enables `quickwit tool local-ingest --input-format parquet` (benchmark-only bulk load).
+parquet = ["dep:sysinfo", "quickwit-indexing/parquet"]
 # Requires to enable tokio unstable via RUSTFLAGS="--cfg tokio_unstable"
 tokio-console = [
   "dep:console-subscriber",

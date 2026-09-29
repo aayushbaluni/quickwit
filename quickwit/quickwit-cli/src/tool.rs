@@ -64,6 +64,11 @@ use crate::{
     run_index_checklist, start_actor_runtimes,
 };
 
+#[cfg(feature = "parquet")]
+mod parquet_ingest;
+#[cfg(feature = "parquet")]
+mod parquet_report;
+
 pub fn build_tool_command() -> Command {
     Command::new("tool")
         .about("Performs utility operations. Requires a node config.")
@@ -71,16 +76,20 @@ pub fn build_tool_command() -> Command {
         .subcommand(
             Command::new("local-ingest")
                 .display_order(10)
-                .about("Indexes NDJSON documents locally.")
-                .long_about("Local ingest indexes locally NDJSON documents from a file or from stdin and uploads splits on the configured storage.")
+                .about("Indexes NDJSON or Parquet documents locally.")
+                .long_about("Local ingest indexes locally NDJSON documents from a file or from stdin, or rows of a local Parquet file (requires the `parquet` feature), and uploads splits on the configured storage.")
                 .args(&[
                     arg!(--index <INDEX> "ID of the target index")
                         .display_order(1)
                         .required(true),
                     arg!(--"input-path" <INPUT_PATH> "Location of the input file.")
                         .required(false),
-                    arg!(--"input-format" <INPUT_FORMAT> "Format of the input data.")
+                    arg!(--"input-format" <INPUT_FORMAT> "Format of the input data: `json`, `plain`, or `parquet`.")
                         .default_value("json")
+                        .required(false),
+                    arg!(--"num-pipelines" <NUM_PIPELINES> "Number of indexing pipelines running in parallel. Values greater than 1 require the `parquet` input format. Defaults to half the number of CPUs with the `parquet` input format, 1 otherwise.")
+                        .required(false),
+                    arg!(--"batch-num-rows" <BATCH_NUM_ROWS> "Number of Parquet rows decoded at once. Only valid with the `parquet` input format.")
                         .required(false),
                     arg!(--overwrite "Overwrites pre-existing index.")
                         .required(false),
@@ -177,6 +186,10 @@ pub struct LocalIngestDocsArgs {
     pub overwrite: bool,
     pub vrl_script: Option<String>,
     pub clear_cache: bool,
+    /// Number of indexing pipelines. Values greater than 1 require the `parquet` input format.
+    pub num_pipelines: NonZeroUsize,
+    /// Number of Parquet rows decoded at once. Only valid with the `parquet` input format.
+    pub batch_num_rows_opt: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -263,7 +276,34 @@ impl ToolCliCommand {
         let overwrite = matches.get_flag("overwrite");
         let vrl_script = matches.remove_one::<String>("transform-script");
         let clear_cache = !matches.get_flag("keep-cache");
+        let num_pipelines_opt: Option<NonZeroUsize> = matches
+            .remove_one::<String>("num-pipelines")
+            .map(|num_pipelines| num_pipelines.parse())
+            .transpose()
+            .context("`num-pipelines` must be a strictly positive integer")?;
+        let batch_num_rows_opt: Option<NonZeroUsize> = matches
+            .remove_one::<String>("batch-num-rows")
+            .map(|batch_num_rows| batch_num_rows.parse())
+            .transpose()
+            .context("`batch-num-rows` must be a strictly positive integer")?;
 
+        if input_format != SourceInputFormat::Parquet {
+            if let Some(num_pipelines) = num_pipelines_opt
+                && num_pipelines.get() > 1
+            {
+                bail!("`--num-pipelines` greater than 1 requires `--input-format parquet`");
+            }
+            if batch_num_rows_opt.is_some() {
+                bail!("`--batch-num-rows` requires `--input-format parquet`");
+            }
+        }
+        let num_pipelines = num_pipelines_opt.unwrap_or_else(|| {
+            if input_format == SourceInputFormat::Parquet {
+                NonZeroUsize::new(quickwit_common::num_cpus() / 2).unwrap_or(NonZeroUsize::MIN)
+            } else {
+                NonZeroUsize::MIN
+            }
+        });
         Ok(Self::LocalIngest(LocalIngestDocsArgs {
             config_uri,
             index_id,
@@ -272,6 +312,8 @@ impl ToolCliCommand {
             overwrite,
             vrl_script,
             clear_cache,
+            num_pipelines,
+            batch_num_rows_opt,
         }))
     }
 
@@ -401,6 +443,14 @@ impl ToolCliCommand {
 
 pub async fn local_ingest_docs_cli(args: LocalIngestDocsArgs) -> anyhow::Result<()> {
     debug!(args=?args, "local-ingest-docs");
+
+    if args.input_format == SourceInputFormat::Parquet {
+        #[cfg(not(feature = "parquet"))]
+        bail!("Quickwit was compiled without the `parquet` feature");
+
+        #[cfg(feature = "parquet")]
+        return parquet_ingest::local_ingest_parquet_cli(args).await;
+    }
     println!("❯ Ingesting documents locally...");
 
     let config = load_node_config(&args.config_uri, None).await?;
@@ -950,7 +1000,7 @@ impl ThroughputCalculator {
     }
 }
 
-async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
+pub(crate) async fn create_empty_cluster(config: &NodeConfig) -> anyhow::Result<Cluster> {
     let self_node = ClusterMember {
         node_id: config.node_id.clone(),
         generation_id: quickwit_cluster::GenerationId::now(),

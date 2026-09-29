@@ -28,8 +28,9 @@ use tracing::info;
 
 use crate::actors::MergeSchedulerService;
 pub use crate::actors::{
-    FinishPendingMergesAndShutdownPipeline, IndexingError, IndexingPipeline,
-    IndexingPipelineParams, IndexingService, PublisherType, Sequencer, SplitsUpdateMailbox,
+    DrainMergesAndShutdownPipeline, FinishPendingMergesAndShutdownPipeline, IndexingError,
+    IndexingPipeline, IndexingPipelineParams, IndexingService, PublisherType, Sequencer,
+    SplitsUpdateMailbox,
 };
 pub use crate::controlled_directory::ControlledDirectory;
 use crate::docs_clustering::Fingerprinter;

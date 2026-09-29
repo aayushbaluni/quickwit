@@ -17,12 +17,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use quickwit_actors::{ActorExitStatus, Mailbox};
-use quickwit_config::FileSourceParams;
+use quickwit_config::{FileSourceParams, SourceInputFormat};
 use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
 use quickwit_proto::types::SourceId;
 
 use super::doc_file_reader::ObjectUriBatchReader;
+#[cfg(feature = "parquet")]
+use super::parquet_file::ParquetFileReader;
 #[cfg(feature = "queue-sources")]
 use super::queue_sources::coordinator::QueueCoordinator;
 use crate::actors::DocProcessor;
@@ -36,6 +38,8 @@ enum FileSourceState {
         num_bytes_processed: u64,
         num_lines_processed: u64,
     },
+    #[cfg(feature = "parquet")]
+    Parquet(Box<ParquetFileReader>),
 }
 
 pub struct FileSource {
@@ -64,6 +68,8 @@ impl Source for FileSource {
                 coordinator.initialize(doc_processor_mailbox, ctx).await
             }
             FileSourceState::Filepath { .. } => Ok(()),
+            #[cfg(feature = "parquet")]
+            FileSourceState::Parquet(_) => Ok(()),
         }
     }
 
@@ -95,6 +101,16 @@ impl Source for FileSource {
                     return Err(ActorExitStatus::Success);
                 }
             }
+            #[cfg(feature = "parquet")]
+            FileSourceState::Parquet(parquet_reader) => {
+                let has_more = parquet_reader
+                    .emit_batches(doc_processor_mailbox, ctx)
+                    .await?;
+                if !has_more {
+                    ctx.send_exit_with_success(doc_processor_mailbox).await?;
+                    return Err(ActorExitStatus::Success);
+                }
+            }
         }
         Ok(Duration::ZERO)
     }
@@ -115,6 +131,11 @@ impl Source for FileSource {
                 coordinator.suggest_truncate(checkpoint, ctx).await
             }
             FileSourceState::Filepath { .. } => Ok(()),
+            #[cfg(feature = "parquet")]
+            FileSourceState::Parquet(parquet_reader) => {
+                parquet_reader.suggest_truncate(&checkpoint);
+                Ok(())
+            }
         }
     }
 
@@ -134,6 +155,8 @@ impl Source for FileSource {
                     "num_lines_processed": num_lines_processed,
                 })
             }
+            #[cfg(feature = "parquet")]
+            FileSourceState::Parquet(parquet_reader) => parquet_reader.observable_state(),
         }
     }
 }
@@ -151,7 +174,20 @@ impl TypedSourceFactory for FileSourceFactory {
     ) -> anyhow::Result<FileSource> {
         let source_id = source_runtime.source_config.source_id.clone();
         let source_type = source_runtime.source_config.source_type();
+        let input_format = source_runtime.source_config.input_format;
         let state = match params {
+            #[cfg(feature = "parquet")]
+            FileSourceParams::Filepath(_) if input_format == SourceInputFormat::Parquet => {
+                let parquet_reader = ParquetFileReader::try_new(&source_runtime).await?;
+                FileSourceState::Parquet(Box::new(parquet_reader))
+            }
+            #[cfg(not(feature = "parquet"))]
+            FileSourceParams::Filepath(_) if input_format == SourceInputFormat::Parquet => {
+                anyhow::bail!("Quickwit was compiled without the `parquet` feature")
+            }
+            FileSourceParams::Notifications(_) if input_format == SourceInputFormat::Parquet => {
+                anyhow::bail!("the `parquet` input format is not supported with file notifications")
+            }
             FileSourceParams::Filepath(file_uri) => {
                 let partition_id = PartitionId::from(file_uri.as_str());
                 let position = source_runtime

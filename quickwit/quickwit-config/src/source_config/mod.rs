@@ -202,6 +202,9 @@ pub enum SourceInputFormat {
     OtlpTracesProtobuf,
     #[serde(alias = "plain")]
     PlainText,
+    /// Apache Parquet file. Only supported by the `quickwit tool local-ingest` CLI command, which
+    /// decodes each row into a JSON object before handing it to the doc processor.
+    Parquet,
 }
 
 impl FromStr for SourceInputFormat {
@@ -211,6 +214,7 @@ impl FromStr for SourceInputFormat {
         match format_str {
             "json" => Ok(Self::Json),
             "plain" => Ok(Self::PlainText),
+            "parquet" => Ok(Self::Parquet),
             unknown => Err(format!("unknown source input format: `{unknown}`")),
         }
     }
@@ -1477,6 +1481,23 @@ mod tests {
             load_source_config_from_user_config(ConfigFormat::Json, file_content.as_bytes())
                 .unwrap();
         assert_eq!(source_config.input_format, SourceInputFormat::PlainText);
+    }
+
+    #[tokio::test]
+    async fn test_source_config_parquet_input_format_is_rejected() {
+        let file_content = r#"{
+            "version": "0.8",
+            "source_id": "parquet-file-source",
+            "source_type": "file",
+            "params": {
+              "filepath": "file:///data/test.parquet"
+            },
+            "input_format": "parquet"
+        }"#;
+        let error =
+            load_source_config_from_user_config(ConfigFormat::Json, file_content.as_bytes())
+                .unwrap_err();
+        assert!(error.to_string().contains("`quickwit tool local-ingest`"));
     }
 
     #[tokio::test]

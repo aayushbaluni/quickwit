@@ -136,6 +136,12 @@ impl SourceConfigForSerialization {
             }
         }
 
+        if self.input_format == SourceInputFormat::Parquet {
+            bail!(
+                "the `parquet` input format can only be used through the CLI command `quickwit \
+                 tool local-ingest`"
+            );
+        }
         if let Some(transform_config) = &self.transform {
             if matches!(
                 self.input_format,

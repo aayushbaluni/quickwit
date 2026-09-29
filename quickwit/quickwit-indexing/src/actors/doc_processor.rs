@@ -130,7 +130,10 @@ fn try_into_vrl_doc(
     num_bytes: usize,
 ) -> Result<VrlDoc, DocProcessorError> {
     let vrl_value = match input_format {
-        SourceInputFormat::Json => serde_json::from_slice::<VrlValue>(&raw_doc)?,
+        // The Parquet file source emits one JSON object per row.
+        SourceInputFormat::Json | SourceInputFormat::Parquet => {
+            serde_json::from_slice::<VrlValue>(&raw_doc)?
+        }
         SourceInputFormat::PlainText => {
             let mut map = std::collections::BTreeMap::new();
             let key = vrl::value::KeyString::from(PLAIN_TEXT);
@@ -155,7 +158,8 @@ fn try_into_json_docs(
     num_bytes: usize,
 ) -> JsonDocIterator {
     match input_format {
-        SourceInputFormat::Json => {
+        // The Parquet file source emits one JSON object per row.
+        SourceInputFormat::Json | SourceInputFormat::Parquet => {
             let json_doc_result = serde_json::from_slice::<JsonObject>(&raw_doc)
                 .map(|json_obj| JsonDoc::new(json_obj, num_bytes));
             JsonDocIterator::from(json_doc_result)

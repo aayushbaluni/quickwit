@@ -62,6 +62,8 @@ mod ingest_api_source;
 mod kafka_source;
 #[cfg(feature = "kinesis")]
 mod kinesis;
+#[cfg(feature = "parquet")]
+pub mod parquet_file;
 #[cfg(feature = "pulsar")]
 mod pulsar_source;
 #[cfg(feature = "queue-sources")]

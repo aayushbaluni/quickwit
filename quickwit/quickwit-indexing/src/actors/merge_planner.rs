@@ -34,6 +34,32 @@ use crate::models::NewSplits;
 #[derive(Debug)]
 pub(crate) struct RunFinalizeMergePolicyAndQuit;
 
+/// Plans and schedules the merge operations proposed by the regular (non-finalize) merge policy,
+/// and reports whether the merge planner is idle.
+///
+/// Used by the merge pipeline to run merges to a fixpoint. See `MergeDrainer`.
+#[derive(Debug)]
+pub(crate) struct MergeDrainProbe;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct MergeDrainProbeReply {
+    /// Number of merge operations scheduled while handling the probe.
+    pub num_scheduled_merge_ops: usize,
+    /// Number of merge operations scheduled by the planner that are not published yet, including
+    /// the ones scheduled while handling the probe.
+    pub num_ongoing_merge_ops: usize,
+}
+
+impl MergeDrainProbeReply {
+    pub fn is_idle(&self) -> bool {
+        self.num_scheduled_merge_ops == 0 && self.num_ongoing_merge_ops == 0
+    }
+}
+
+/// Makes the merge planner exit successfully without running the finalize merge policy.
+#[derive(Debug)]
+pub(crate) struct QuitMergePlanner;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MergePartition {
     partition_id: u64,
@@ -135,6 +161,37 @@ impl Handler<RunFinalizeMergePolicyAndQuit> for MergePlanner {
         // Note we ignore messages that could be coming from a different incarnation.
         // (See comment on `Self::incarnation_start_at`.)
         self.send_merge_ops(true, ctx).await?;
+        Err(ActorExitStatus::Success)
+    }
+}
+
+#[async_trait]
+impl Handler<MergeDrainProbe> for MergePlanner {
+    type Reply = MergeDrainProbeReply;
+
+    async fn handle(
+        &mut self,
+        _probe: MergeDrainProbe,
+        ctx: &ActorContext<Self>,
+    ) -> Result<MergeDrainProbeReply, ActorExitStatus> {
+        let num_scheduled_merge_ops = self.send_merge_ops(false, ctx).await?;
+        self.recompute_known_splits_if_necessary();
+        Ok(MergeDrainProbeReply {
+            num_scheduled_merge_ops,
+            num_ongoing_merge_ops: self.ongoing_merge_operations_inventory.len(),
+        })
+    }
+}
+
+#[async_trait]
+impl Handler<QuitMergePlanner> for MergePlanner {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _quit: QuitMergePlanner,
+        _ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
         Err(ActorExitStatus::Success)
     }
 }
@@ -319,17 +376,19 @@ impl MergePlanner {
         Ok(merge_operations)
     }
 
+    /// Returns the number of scheduled merge operations.
     async fn send_merge_ops(
         &mut self,
         is_finalize: bool,
         ctx: &ActorContext<Self>,
-    ) -> Result<(), ActorExitStatus> {
+    ) -> Result<usize, ActorExitStatus> {
         // We identify all of the merge operations we want to run and leave it
         // to the merge scheduler to decide in which order these should be scheduled.
         //
         // The merge scheduler has the merit of knowing about merge operations from other
         // index as well.
         let merge_ops = self.compute_merge_ops(is_finalize, ctx).await?;
+        let num_merge_ops = merge_ops.len();
         for merge_operation in merge_ops {
             debug!(merge_operation=?merge_operation, "schedule merge operation");
             let tracked_merge_operation = self
@@ -342,7 +401,7 @@ impl MergePlanner {
             )
             .await?
         }
-        Ok(())
+        Ok(num_merge_ops)
     }
 }
 
